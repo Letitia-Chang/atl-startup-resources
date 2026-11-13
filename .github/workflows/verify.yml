@@ -1,0 +1,35 @@
+name: Verify plugin
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install build-only dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Rebuild plugin
+        run: pnpm build
+      - name: Validate emitted module and update policy
+        run: |
+          node --check dist/plugin.js
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const manifest = JSON.parse(fs.readFileSync("dist/manifest.json", "utf8"));
+            if (manifest.id !== "atl.startup-resources" || manifest.apiVersion !== 1) throw new Error("Unexpected plugin identity or API version");
+            if (manifest.updates?.defaultEnabled !== true) throw new Error("Git update checks must default to enabled");
+            if (manifest.host) throw new Error("This offline plugin must not request host access");
+          '
+      - name: Reject stale checked-in artifacts
+        run: git diff --exit-code -- dist/manifest.json dist/plugin.js

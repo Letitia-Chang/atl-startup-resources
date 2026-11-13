@@ -1,0 +1,9 @@
+{
+  "id": "atl.startup-resources",
+  "name": "ATL Startup Resources",
+  "apiVersion": 1,
+  "description": "Search Atlanta startup programs, funding, workspaces, events and community resources.",
+  "updates": {
+    "defaultEnabled": true
+  }
+}
