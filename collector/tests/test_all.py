@@ -79,6 +79,19 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(enriched.registration_url, "https://www.eventbrite.com/e/reps-podcasts-tickets-2002658757253?utm_source=calendar")
         self.assertEqual(enriched.format, "in-person")
 
+    def test_atv_reused_detail_date_never_enriches_another_occurrence(self) -> None:
+        connector = AtlantaTechVillageConnector()
+        event = connector.parse((FIXTURES / "atv-events.html").read_bytes(), REFERENCE, 120)[0]
+        detail = (FIXTURES / "atv-detail.html").read_text().replace(
+            "Tuesday, November 17, 2026", "Tuesday, November 24, 2026"
+        )
+        enriched = connector.enrich(event, detail)
+        self.assertEqual(enriched.start_date, event.start_date)
+        self.assertIsNone(enriched.start_time)
+        self.assertIsNone(enriched.registration_url)
+        self.assertEqual(enriched.venue, "")
+        self.assertTrue(any("did not match" in warning for warning in connector.warnings))
+
     def test_atdc_access_format_and_source_urls(self) -> None:
         connector = ATDCConnector()
         events = connector.parse((FIXTURES / "atdc-events.html").read_bytes(), REFERENCE, 120)

@@ -131,7 +131,7 @@ class HttpClient:
 def render_page(url: str, timeout_ms: int = 45_000) -> bytes:
     """Render one public ATDC page, without signing in or interacting with controls."""
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except ImportError as exc:
         raise CollectionError(
             "ATDC needs browser rendering for this response; install the 'browser' extra and Chromium"
@@ -139,20 +139,27 @@ def render_page(url: str, timeout_ms: int = 45_000) -> bytes:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
-            page = browser.new_page(user_agent=USER_AGENT)
+            # Some Salesforce portal bundles require a complete browser UA. This
+            # remains a normal headless Chromium page, with no login or controls bypassed.
+            page = browser.new_page(viewport={"width": 1440, "height": 1200})
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             # The portal has unrelated headings (for example, Change Currency).
             # Wait for a dated public event card, not merely the first h3.
-            page.wait_for_function(
-                r"""() => Array.from(document.querySelectorAll('h3')).some((heading) => {
-                    let node = heading;
-                    for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
-                        if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/i.test(node.innerText || '') && node.querySelectorAll('h3').length === 1) return true;
-                    }
-                    return false;
-                })""",
-                timeout=timeout_ms,
-            )
+            try:
+                page.wait_for_function(
+                    r"""() => Array.from(document.querySelectorAll('h3')).some((heading) => {
+                        let node = heading;
+                        for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
+                            if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/i.test(node.innerText || '') && node.querySelectorAll('h3').length === 1) return true;
+                        }
+                        return false;
+                    })""",
+                    timeout=timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                # Return the real failure DOM so selector/bootstrap problems can be
+                # diagnosed instead of repeatedly retrying the same wait.
+                LOGGER.warning("ATDC events did not render in time; retaining browser DOM for diagnostics")
             return page.content().encode()
         finally:
             browser.close()

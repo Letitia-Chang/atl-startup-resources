@@ -51,7 +51,8 @@ class Connector:
 class AtlantaTechVillageConnector(Connector):
     key = "atlanta-tech-village"
     url = "https://atlantatechvillage.com/events"
-    detail_limit = 20
+    # Bound source traffic while covering a typical four-month listing window.
+    detail_limit = 60
 
     def parse(self, body: bytes | str, reference: date, days: int) -> list[Event]:
         self.warnings = []
@@ -124,14 +125,20 @@ class AtlantaTechVillageConnector(Connector):
             text,
             re.IGNORECASE,
         )
-        start_time = event.start_time
-        end_time = event.end_time
-        if when_match:
-            times = re.findall(
-                r"(?:[1-9]|1[0-2])(?::[0-5]\d)?\s*[AaPp]\.?[Mm]\.?", when_match.group(2)
+        if not when_match:
+            self.warnings.append(f"Detail date not found for {event.source_url}; kept listing-only fields")
+            return event
+        detail_date = MONTH_DATE_RE.search(when_match.group(1))
+        if not detail_date or _iso_date(detail_date) != event.start_date:
+            self.warnings.append(
+                f"Detail date did not match the listing for {event.source_url}; kept listing-only fields"
             )
-            start_time = parse_time(times[0]) if times else None
-            end_time = parse_time(times[1]) if len(times) > 1 else None
+            return event
+        times = re.findall(
+            r"(?:[1-9]|1[0-2])(?::[0-5]\d)?\s*[AaPp]\.?[Mm]\.?", when_match.group(2)
+        )
+        start_time = parse_time(times[0]) if times else None
+        end_time = parse_time(times[1]) if len(times) > 1 else None
         registration_url = event.registration_url
         for anchor in doc.xpath("//a[@href]"):
             label = clean_text(anchor.text_content()).casefold()
