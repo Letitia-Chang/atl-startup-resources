@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import date, datetime, timedelta
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from lxml import html
@@ -56,7 +56,8 @@ class AtlantaTechVillageConnector(Connector):
 
     def parse(self, body: bytes | str, reference: date, days: int) -> list[Event]:
         self.warnings = []
-        doc = html.fromstring(body, base_url=self.url)
+        text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+        doc = html.fromstring(text_body, base_url=self.url)
         events: dict[str, Event] = {}
         for anchor in doc.xpath('//a[@href][contains(@href, "/events/")]'):
             href = urljoin(self.url, anchor.get("href") or "")
@@ -112,12 +113,24 @@ class AtlantaTechVillageConnector(Connector):
 
     def enrich(self, event: Event, body: bytes | str) -> Event:
         """Fill fields available on an ATV detail page without guessing missing data."""
-        doc = html.fromstring(body, base_url=event.source_url)
+        text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+        doc = html.fromstring(text_body, base_url=event.source_url)
         # Join text nodes explicitly: text_content() concatenates adjacent inline labels
         # (for example, "WHEN" + "Tuesday"), losing the separator parsers need.
         text = clean_text(" ".join(doc.xpath("//body//text()")))
-        location_match = re.search(r"\bWHERE\b(.*?)\bWHEN\b", text, re.IGNORECASE)
-        venue = clean_text(location_match.group(1)) if location_match else event.venue
+        venue = event.venue
+        location_labels = doc.xpath("//*[not(*) and normalize-space(text())='WHERE']")
+        if location_labels:
+            location_parts: list[str] = []
+            for sibling in location_labels[0].itersiblings():
+                if clean_text(sibling.text_content()).casefold() == "when":
+                    break
+                location_parts.append(sibling.text_content())
+            candidate = clean_text(" ".join(location_parts))
+            if candidate and len(candidate) <= 240:
+                venue = candidate
+            else:
+                self.warnings.append(f"Location block was empty or too broad for {event.source_url}")
         when_match = re.search(
             r"\bWHEN\b\s+((?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+)?"
             r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
@@ -158,10 +171,12 @@ class AtlantaTechVillageConnector(Connector):
 class ATDCConnector(Connector):
     key = "atdc"
     url = "https://portal.atdc.org/s/events"
+    detail_limit = 60
 
     def parse(self, body: bytes | str, reference: date, days: int) -> list[Event]:
         self.warnings = []
-        doc = html.fromstring(body, base_url=self.url)
+        text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+        doc = html.fromstring(text_body, base_url=self.url)
         events: dict[str, Event] = {}
         for heading in doc.xpath("//h3"):
             title = clean_text(heading.text_content())
@@ -191,14 +206,30 @@ class ATDCConnector(Connector):
             description = card_text.replace(title, "", 1).replace(date_match.group(0), "", 1)
             description = clean_text(re.sub(r"\s+[01]\d\s+[01]\d\s+Next Page.*$", "", description))
             event_url = self.url
+            record_id = ""
+            routes = card.xpath(".//button[@data-url]/@data-url")
+            if routes:
+                route = urlsplit(urljoin(self.url, routes[0]))
+                identifiers = parse_qs(route.query).get("event", [])
+                if route.hostname == "portal.atdc.org" and len(identifiers) == 1 and re.fullmatch(r"[A-Za-z0-9]{15,18}", identifiers[0]):
+                    record_id = identifiers[0]
+                    event_url = f"https://portal.atdc.org/s/community-event?id={record_id}"
             for anchor in card.xpath(".//a[@href]"):
+                if record_id:
+                    break
                 href = urljoin(self.url, anchor.get("href") or "")
                 if urlsplit(href).hostname == "portal.atdc.org" and urlsplit(href).path != "/s/events":
                     event_url = href
                     break
             external_key = f"{title}|{start_date}"
-            external_id = hashlib.sha256(external_key.encode()).hexdigest()[:24]
+            external_id = record_id or hashlib.sha256(external_key.encode()).hexdigest()[:24]
             combined = title + " " + description
+            if re.search(r"\bAlpharetta\b", combined, re.IGNORECASE):
+                city = "Alpharetta"
+            elif re.search(r"\bAtlanta\b", combined, re.IGNORECASE):
+                city = "Atlanta"
+            else:
+                city = ""
             events[external_id] = Event(
                 source=self.key,
                 external_id=external_id,
@@ -206,12 +237,76 @@ class ATDCConnector(Connector):
                 source_url=event_url,
                 start_date=start_date,
                 description=description,
+                city=city,
                 access=infer_access(combined),
                 topics=[],
             )
         if not events:
             self.warnings.append("No dated ATDC events found; the portal may require browser rendering")
         return sorted(events.values(), key=lambda event: (event.start_date, event.title))
+
+    def enrich(self, event: Event, body: bytes | str) -> Event:
+        """Enrich an ATDC occurrence from its own public community-event page."""
+        text_body = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+        doc = html.fromstring(text_body, base_url=event.source_url)
+        headings = [
+            heading for heading in doc.xpath("//h1")
+            if clean_text(heading.text_content()) == event.title
+        ]
+        if not headings:
+            self.warnings.append(f"ATDC detail title did not match {event.source_url}")
+            return event
+        for anchor in doc.xpath('//a[@href][contains(@href, "google.com/calendar/render")]'):
+            query = parse_qs(urlsplit(anchor.get("href") or "").query)
+            calendar_dates = query.get("dates", [])
+            zones = query.get("ctz", [])
+            if not calendar_dates or zones != [ATLANTA_TZ]:
+                continue
+            fields = calendar_dates[0].split("/")
+            if len(fields) != 2:
+                continue
+            try:
+                starts = datetime.strptime(fields[0], "%Y%m%dT%H%M%S")
+                ends = datetime.strptime(fields[1], "%Y%m%dT%H%M%S")
+            except ValueError:
+                continue
+            if starts.date().isoformat() != event.start_date or ends <= starts:
+                self.warnings.append(f"ATDC detail date/time did not match {event.source_url}")
+                return event
+            venue = event.venue
+            node = headings[0]
+            for _ in range(5):
+                if node.getparent() is None:
+                    break
+                node = node.getparent()
+                detail_text = clean_text(" ".join(node.itertext()))
+                match = re.search(
+                    r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
+                    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+                    r"\s+\d{1,2}(?:st|nd|rd|th)",
+                    detail_text,
+                    re.IGNORECASE,
+                )
+                if match and event.title in detail_text[:match.start()]:
+                    prefix = detail_text[:match.start()]
+                    candidate = clean_text(prefix.rsplit(event.title, 1)[-1])
+                    if candidate and len(candidate) <= 240:
+                        venue = candidate
+                    break
+            if re.search(r"\bAlpharetta\b", venue, re.IGNORECASE):
+                city = "Alpharetta"
+            elif re.search(r"\bAtlanta\b", venue, re.IGNORECASE):
+                city = "Atlanta"
+            else:
+                city = ""
+            return event.with_details(
+                start_time=starts.strftime("%H:%M"),
+                end_time=ends.strftime("%H:%M"),
+                city=city,
+                venue=venue,
+            )
+        self.warnings.append(f"ATDC detail calendar data was not verified for {event.source_url}")
+        return event
 
 
 CONNECTORS: dict[str, Connector] = {

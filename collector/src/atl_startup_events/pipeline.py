@@ -11,7 +11,7 @@ import urllib.robotparser
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from .connectors import CONNECTORS, Connector, atlanta_today
@@ -128,39 +128,112 @@ class HttpClient:
         raise AssertionError("unreachable")
 
 
-def render_page(url: str, timeout_ms: int = 45_000) -> bytes:
-    """Render one public ATDC page, without signing in or interacting with controls."""
+def render_event_pages(
+    url: str,
+    on_page: Callable[[int, bytes], None],
+    timeout_ms: int = 45_000,
+    max_pages: int = 10,
+) -> list[bytes]:
+    """Render public ATDC listing pages; never sign in, filter, or submit forms."""
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except ImportError as exc:
         raise CollectionError(
             "ATDC needs browser rendering for this response; install the 'browser' extra and Chromium"
         ) from exc
+    card_texts = r"""() => Array.from(document.querySelectorAll('h3')).map((heading) => {
+        let node = heading;
+        for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
+            if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/i.test(node.innerText || '') && node.querySelectorAll('h3').length === 1) return node.innerText;
+        }
+        return '';
+    }).filter(Boolean)"""
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
-            # Some Salesforce portal bundles require a complete browser UA. This
-            # remains a normal headless Chromium page, with no login or controls bypassed.
+            # The Salesforce portal needs a complete browser UA. This is a normal
+            # public Chromium session with no controls or authentication bypassed.
             page = browser.new_page(viewport={"width": 1440, "height": 1200})
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            # The portal has unrelated headings (for example, Change Currency).
-            # Wait for a dated public event card, not merely the first h3.
             try:
                 page.wait_for_function(
-                    r"""() => Array.from(document.querySelectorAll('h3')).some((heading) => {
-                        let node = heading;
-                        for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
-                            if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/i.test(node.innerText || '') && node.querySelectorAll('h3').length === 1) return true;
-                        }
-                        return false;
-                    })""",
+                    f"({card_texts})().length > 0",
                     timeout=timeout_ms,
                 )
             except PlaywrightTimeoutError:
-                # Return the real failure DOM so selector/bootstrap problems can be
-                # diagnosed instead of repeatedly retrying the same wait.
                 LOGGER.warning("ATDC events did not render in time; retaining browser DOM for diagnostics")
-            return page.content().encode()
+            pages: list[bytes] = []
+            seen_routes: set[str] = set()
+            for page_number in range(1, max_pages + 1):
+                raw = page.content().encode()
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise CollectionError(f"Rendered page exceeds {MAX_RESPONSE_BYTES} bytes")
+                pages.append(raw)
+                on_page(page_number, raw)
+                next_page = page.locator('button[data-name="nextPage"]')
+                if not next_page.count() or not next_page.first.is_visible():
+                    return pages
+                next_page = next_page.first
+                if next_page.is_disabled() or next_page.get_attribute("aria-disabled") == "true":
+                    return pages
+                route = next_page.get_attribute("data-route") or ""
+                if route in seen_routes:
+                    raise CollectionError(f"ATDC pagination repeated {route!r}")
+                seen_routes.add(route)
+                previous = page.evaluate(f"JSON.stringify(({card_texts})())")
+                next_page.click()
+                try:
+                    page.wait_for_function(
+                        f"previous => JSON.stringify(({card_texts})()) !== previous",
+                        arg=previous,
+                        timeout=timeout_ms,
+                    )
+                except PlaywrightTimeoutError as exc:
+                    raise CollectionError("ATDC Next Page did not advance to a new event set") from exc
+            raise CollectionError(f"ATDC pagination exceeded the {max_pages}-page safety limit")
+        finally:
+            browser.close()
+
+
+def render_event_details(urls: list[str], timeout_ms: int = 20_000) -> dict[str, bytes]:
+    """Read public ATDC detail pages, with no registration or login interactions."""
+    if not urls:
+        return {}
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+    except ImportError as exc:
+        raise CollectionError(
+            "ATDC detail rendering requires the 'browser' extra and Chromium"
+        ) from exc
+    rendered: dict[str, bytes] = {}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 1200})
+            failures = 0
+            for url in urls:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.wait_for_selector(
+                        'a[href*="google.com/calendar/render"][href*="dates="]',
+                        state="attached",
+                        timeout=timeout_ms,
+                    )
+                    failures = 0
+                except PlaywrightTimeoutError:
+                    failures += 1
+                    LOGGER.warning("No verified calendar link rendered for %s", url)
+                raw = page.content().encode()
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise CollectionError(f"Rendered detail exceeds {MAX_RESPONSE_BYTES} bytes")
+                rendered[url] = raw
+                # Browser rendering performs real source requests; keep the same
+                # one-second-per-host pacing as the conservative HTTP client.
+                page.wait_for_timeout(1000)
+                if failures >= 2:
+                    LOGGER.warning("Stopping ATDC detail rendering after repeated missing calendar data")
+                    break
+            return rendered
         finally:
             browser.close()
 
@@ -180,14 +253,46 @@ def refresh_source(
         raw = client.get(connector.url).body
         events = connector.parse(raw, reference, days)
         warnings.extend(connector.warnings)
+        browser_details: dict[str, bytes] = {}
         if not events and connector.key == "atdc" and allow_browser:
-            LOGGER.info("ATDC returned no static events; trying public browser rendering")
-            raw = render_page(connector.url)
-            # Keep a distinct diagnostic snapshot; never substitute rendered bytes
-            # for the conditional HTTP cache keyed by the actual request URL.
-            store.cache_put(connector.url + "#rendered", raw, None, None)
-            events = connector.parse(raw, reference, days)
-            warnings.extend(connector.warnings)
+            LOGGER.info("ATDC returned no static events; collecting its public browser pages")
+            def retain_page(page_number: int, rendered: bytes) -> None:
+                suffix = "#rendered" if page_number == 1 else f"#rendered-page-{page_number}"
+                # Diagnostic keys never replace conditional HTTP response caches.
+                store.cache_put(connector.url + suffix, rendered, None, None)
+            rendered_pages = render_event_pages(connector.url, retain_page)
+            by_id: dict[str, Event] = {}
+            for rendered in rendered_pages:
+                page_events = connector.parse(rendered, reference, days)
+                warnings.extend(connector.warnings)
+                for page_event in page_events:
+                    by_id[page_event.event_id] = page_event
+            events = sorted(by_id.values(), key=lambda event: (event.start_date, event.title))
+            detail_limit = getattr(connector, "detail_limit", 60)
+            detail_urls = [event.source_url for event in events][:detail_limit]
+            if len(events) > detail_limit:
+                warnings.append(
+                    f"ATDC detail enrichment was capped at {detail_limit}; later occurrences keep listing-only precision"
+                )
+            allowed_urls: list[str] = []
+            for detail_url in detail_urls:
+                try:
+                    if client.allowed(detail_url):
+                        allowed_urls.append(detail_url)
+                    else:
+                        warnings.append(f"robots.txt does not allow ATDC detail collection: {detail_url}")
+                except Exception as exc:
+                    warnings.append(f"Could not check ATDC detail permissions: {exc}")
+            try:
+                browser_details = render_event_details(allowed_urls)
+                for detail_url, rendered in browser_details.items():
+                    store.cache_put(detail_url + "#rendered", rendered, None, None)
+                if len(browser_details) < len(allowed_urls):
+                    warnings.append(
+                        f"Rendered {len(browser_details)} of {len(allowed_urls)} ATDC detail pages; remaining events keep listing-only precision"
+                    )
+            except Exception as exc:
+                warnings.append(f"ATDC detail browser rendering failed; keeping listing events: {exc}")
         if not events:
             raise CollectionError("No events parsed; source changed or currently has no listed events")
 
@@ -197,7 +302,11 @@ def refresh_source(
             event = base_event
             if enrichable and index < detail_limit:
                 try:
-                    event = enrichable(base_event, client.get(base_event.source_url).body)
+                    if connector.key == "atdc":
+                        if base_event.source_url in browser_details:
+                            event = enrichable(base_event, browser_details[base_event.source_url])
+                    else:
+                        event = enrichable(base_event, client.get(base_event.source_url).body)
                 except Exception as exc:  # Keep the useful listing event when only detail fetch fails.
                     warnings.append(f"Detail enrichment failed for {base_event.source_url}: {exc}")
             try:
@@ -207,6 +316,7 @@ def refresh_source(
                 warnings.append(f"Rejected invalid {event.source} event {event.title!r}: {exc}")
         if not seen_ids:
             raise CollectionError("Every parsed event failed validation")
+        warnings = list(dict.fromkeys(warnings))
         store.record_run(
             connector.key,
             started,

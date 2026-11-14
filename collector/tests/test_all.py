@@ -72,7 +72,10 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(first.external_id, "r-e-p-s-podcasts-20261117")
         self.assertEqual(first.start_date, "2026-11-17")
         self.assertIsNone(first.start_time)
-        enriched = connector.enrich(first, (FIXTURES / "atv-detail.html").read_bytes())
+        detail = (FIXTURES / "atv-detail.html").read_text().replace(
+            "<main>", "<p>Atlanta Tech Village is where founders grow and scale their companies.</p><main>"
+        )
+        enriched = connector.enrich(first, detail)
         self.assertEqual(enriched.start_time, "14:00")
         self.assertEqual(enriched.end_time, "16:00")
         self.assertIn("Terminus Hub", enriched.venue)
@@ -100,7 +103,19 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(events[0].format, "in-person")
         self.assertEqual(events[1].format, "virtual")
         self.assertEqual(events[2].access, "invite-only")
-        self.assertTrue(events[0].source_url.startswith("https://portal.atdc.org/s/events/"))
+        self.assertEqual(events[0].source_url, "https://portal.atdc.org/s/community-event?id=a1YVU00000TEST1")
+        self.assertEqual(events[0].external_id, "a1YVU00000TEST1")
+        self.assertEqual(events[0].city, "")
+        self.assertEqual(events[1].city, "")
+        enriched = connector.enrich(events[0], (FIXTURES / "atdc-detail.html").read_bytes())
+        self.assertEqual(enriched.start_time, "08:30")
+        self.assertEqual(enriched.end_time, "09:30")
+        self.assertEqual(enriched.venue, "ATDC Atlanta Community Room")
+        self.assertEqual(enriched.city, "Atlanta")
+        stale = (FIXTURES / "atdc-detail.html").read_text().replace("20261116T083000/20261116T093000", "20261117T083000/20261117T093000")
+        unchanged = connector.enrich(events[0], stale)
+        self.assertIsNone(unchanged.start_time)
+        self.assertEqual(unchanged.venue, "")
 
     def test_empty_markup_is_a_source_warning_not_an_empty_success(self) -> None:
         connector = ATDCConnector()
