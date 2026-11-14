@@ -34,6 +34,7 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=collector/src python -m unittest discover -s collector/tests -v
       - name: Collect public event candidates
         run: |
+          set -o pipefail
           mkdir -p build/live
           PYTHONPATH=collector/src python -m atl_startup_events.cli --db build/live/events.db refresh --days 120 --export build/live/approved.json | tee build/live/collection-results.jsonl
       - name: Export review queue and source health without approving events

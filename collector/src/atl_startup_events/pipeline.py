@@ -141,7 +141,18 @@ def render_page(url: str, timeout_ms: int = 45_000) -> bytes:
         try:
             page = browser.new_page(user_agent=USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.locator("h3").first.wait_for(state="attached", timeout=timeout_ms)
+            # The portal has unrelated headings (for example, Change Currency).
+            # Wait for a dated public event card, not merely the first h3.
+            page.wait_for_function(
+                r"""() => Array.from(document.querySelectorAll('h3')).some((heading) => {
+                    let node = heading;
+                    for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
+                        if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}\b/i.test(node.innerText || '') && node.querySelectorAll('h3').length === 1) return true;
+                    }
+                    return false;
+                })""",
+                timeout=timeout_ms,
+            )
             return page.content().encode()
         finally:
             browser.close()
@@ -165,6 +176,9 @@ def refresh_source(
         if not events and connector.key == "atdc" and allow_browser:
             LOGGER.info("ATDC returned no static events; trying public browser rendering")
             raw = render_page(connector.url)
+            # Keep a distinct diagnostic snapshot; never substitute rendered bytes
+            # for the conditional HTTP cache keyed by the actual request URL.
+            store.cache_put(connector.url + "#rendered", raw, None, None)
             events = connector.parse(raw, reference, days)
             warnings.extend(connector.warnings)
         if not events:
