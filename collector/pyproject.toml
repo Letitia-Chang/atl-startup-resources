@@ -1,0 +1,22 @@
+[project]
+name = "atl-startup-events"
+version = "0.1.0"
+description = "Atlanta startup event ingestion, review, and read-only API"
+requires-python = ">=3.11"
+dependencies = ["lxml>=6,<7"]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.58,<2"]
+
+[project.scripts]
+atl-events = "atl_startup_events.cli:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,3 @@
+lxml>=6,<7
+# Optional only for JavaScript-rendered ATDC portal responses:
+# playwright>=1.58,<2

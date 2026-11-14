@@ -1,1 +1,5 @@
 node_modules/
+collector/build/
+collector/var/
+**/__pycache__/
+*.egg-info/
